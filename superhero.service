@@ -1,0 +1,14 @@
+[Unit]
+Description=Superhero Bot - Reddit RSS Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=superhero
+WorkingDirectory=/opt/superhero
+ExecStart=/opt/superhero/venv/bin/python -m app.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
