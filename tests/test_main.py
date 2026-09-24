@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
+from datetime import datetime, timezone
 
-from app.main import get_new_entries
+from app.main import get_new_entries, is_notification_time
 
 
 class RedditFeedBotTests(unittest.TestCase):
@@ -31,6 +33,22 @@ class RedditFeedBotTests(unittest.TestCase):
         self.assertEqual(len(new_entries), 1)
         self.assertEqual(new_entries[0]["title"], "No ID here")
         self.assertIn("https://example.com/xyz", seen)
+
+
+    def test_is_notification_time_at_correct_hour(self):
+        with patch('app.main.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 1, 1, 7, 0, tzinfo=timezone.utc)
+            self.assertTrue(is_notification_time())
+
+    def test_is_notification_time_at_wrong_hour(self):
+        with patch('app.main.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 1, 1, 8, 0, tzinfo=timezone.utc)
+            self.assertFalse(is_notification_time())
+
+    def test_is_notification_time_at_wrong_minute(self):
+        with patch('app.main.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 1, 1, 7, 5, tzinfo=timezone.utc)
+            self.assertFalse(is_notification_time())
 
 
 if __name__ == "__main__":

@@ -138,7 +138,7 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
 
 def is_notification_time() -> bool:
     """Check if it's time to send the daily notification (12PM PKT = 7AM UTC)."""
-    now = datetime.now(datetime.UTC)
+    now = datetime.now(datetime.timezone.utc)
     return now.hour == NOTIFY_HOUR_UTC and now.minute == NOTIFY_MINUTE_UTC
 
 
@@ -149,7 +149,7 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
     
     while True:
         # Check if it's time to send notification
-        now = datetime.now(datetime.UTC)
+        now = datetime.now(datetime.timezone.utc)
         if is_notification_time() and last_notification_date != now.date():
             print(f"[{datetime.now().isoformat(timespec='seconds')}] Sending daily notification...")
             send_email_notification(collected_posts)
