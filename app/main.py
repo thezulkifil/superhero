@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SUBREDDITS = ["glasses", "eyeglasses", "optometry", "ContactLenses"]
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 300  # 5 minutes - Reddit RSS limit is 1 req per ~60s
 USER_AGENT = "superhero-bot/0.1"
 KEYWORDS = ["affordable glasses", "cheap glasses", "affordable eyeglasses"]
 
@@ -40,11 +40,15 @@ def fetch_multiple_subreddit_feeds(subreddits: list[str]) -> list[tuple[str, dic
             feed = fetch_subreddit_feed(subreddit)
             feeds.append((subreddit, feed))
         except requests.RequestException as exc:
-            print(f"[{datetime.now().isoformat(timespec='seconds')}] Failed to fetch r/{subreddit}: {exc}")
+            if "429" in str(exc):
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] Rate limited on r/{subreddit}, waiting 60s...")
+                time.sleep(60)
+            else:
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] Failed to fetch r/{subreddit}: {exc}")
         
-        # Add delay between requests to avoid rate limiting
+        # Reddit RSS limit: 1 request per ~60 seconds
         if i < len(subreddits) - 1:
-            time.sleep(2)
+            time.sleep(60)
     
     return feeds
 
