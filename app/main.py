@@ -136,10 +136,10 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
         print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to send email: {exc}")
 
 
-def is_notification_time() -> bool:
-    """Check if it's time to send the daily notification (12PM PKT = 7AM UTC)."""
+def notification_time_today() -> datetime:
+    """Return today's notification time as a timezone-aware UTC datetime (12PM PKT = 7AM UTC)."""
     now = datetime.now(timezone.utc)
-    return now.hour == NOTIFY_HOUR_UTC and now.minute == NOTIFY_MINUTE_UTC
+    return now.replace(hour=NOTIFY_HOUR_UTC, minute=NOTIFY_MINUTE_UTC, second=0, microsecond=0)
 
 
 def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECONDS, once: bool = False, keywords: list[str] | None = None) -> None:
@@ -150,7 +150,8 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
     while True:
         # Check if it's time to send notification
         now = datetime.now(timezone.utc)
-        if is_notification_time() and last_notification_date != now.date():
+        notify_time = notification_time_today()
+        if now >= notify_time and last_notification_date != now.date():
             print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending daily notification...")
             send_email_notification(collected_posts)
             collected_posts = []  # Reset collection
