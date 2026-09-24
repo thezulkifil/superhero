@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import feedparser
@@ -41,10 +41,10 @@ def fetch_multiple_subreddit_feeds(subreddits: list[str]) -> list[tuple[str, dic
             feeds.append((subreddit, feed))
         except requests.RequestException as exc:
             if "429" in str(exc):
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] Rate limited on r/{subreddit}, waiting 60s...")
+                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Rate limited on r/{subreddit}, waiting 60s...")
                 time.sleep(60)
             else:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] Failed to fetch r/{subreddit}: {exc}")
+                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to fetch r/{subreddit}: {exc}")
         
         # Reddit RSS limit: 1 request per ~60 seconds
         if i < len(subreddits) - 1:
@@ -97,9 +97,9 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
     sender_email = os.getenv("SENDER_EMAIL")
     recipient_email = os.getenv("RECIPIENT_EMAIL")
     
-    if not all([api_key, sender_email, recipient_email]):
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Email not configured. Skipping notification.")
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Collected {len(collected_posts)} posts:")
+    if not api_key or not sender_email or not recipient_email:
+        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email not configured. Skipping notification.")
+        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Collected {len(collected_posts)} posts:")
         for post in collected_posts:
             print(f"  - {post['title']} -> {post['link']}")
         return
@@ -131,14 +131,14 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
             timeout=30,
         )
         response.raise_for_status()
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Email sent successfully to {recipient_email}")
+        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email sent successfully to {recipient_email}")
     except requests.RequestException as exc:
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Failed to send email: {exc}")
+        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to send email: {exc}")
 
 
 def is_notification_time() -> bool:
     """Check if it's time to send the daily notification (12PM PKT = 7AM UTC)."""
-    now = datetime.now(datetime.timezone.utc)
+    now = datetime.now(timezone.utc)
     return now.hour == NOTIFY_HOUR_UTC and now.minute == NOTIFY_MINUTE_UTC
 
 
@@ -149,9 +149,9 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
     
     while True:
         # Check if it's time to send notification
-        now = datetime.now(datetime.timezone.utc)
+        now = datetime.now(timezone.utc)
         if is_notification_time() and last_notification_date != now.date():
-            print(f"[{datetime.now().isoformat(timespec='seconds')}] Sending daily notification...")
+            print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending daily notification...")
             send_email_notification(collected_posts)
             collected_posts = []  # Reset collection
             last_notification_date = now.date()
@@ -164,14 +164,14 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
                 new_entries = get_new_entries(feed, seen_ids, keywords)
 
                 if not new_entries:
-                    print(f"[{datetime.now().isoformat(timespec='seconds')}] No new posts in r/{subreddit}.")
+                    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] No new posts in r/{subreddit}.")
                 else:
-                    print(f"[{datetime.now().isoformat(timespec='seconds')}] Found {len(new_entries)} new post(s) in r/{subreddit}:")
+                    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Found {len(new_entries)} new post(s) in r/{subreddit}:")
                     for post in new_entries:
                         print(f"  - {post['title']} -> {post['link']}")
                         collected_posts.append(post)
-            except Exception as exc:  # pragma: no cover - defensive catch for unexpected feed issues
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] Error checking r/{subreddit}: {exc}")
+            except (KeyError, TypeError, ValueError) as exc:  # pragma: no cover - defensive catch for unexpected feed issues
+                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Error checking r/{subreddit}: {exc}")
 
         if once:
             return
