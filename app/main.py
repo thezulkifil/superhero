@@ -11,15 +11,40 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-SUBREDDITS = ["glasses", "eyeglasses", "optometry", "ContactLenses"]
-CHECK_INTERVAL_SECONDS = 300  # 5 minutes - Reddit RSS limit is 1 req per ~60s
+SUBREDDITS = [
+    "glasses",
+    "glassesadvice",
+    "eyeglasses",
+    "optometry",
+    "Frugal",
+    "BuyItForLife",
+    "Budget",
+    "GoodValue",
+    "FrugalFemaleFashion",
+    "FrugalMaleFashion",
+]
+CHECK_INTERVAL_SECONDS = 300  # 5 minutes
 USER_AGENT = "superhero-bot/0.1"
-KEYWORDS = ["affordable glasses", "cheap glasses", "affordable eyeglasses"]
-
-# Pakistan Standard Time is UTC+5
-# 12PM PKT = 7AM UTC
-NOTIFY_HOUR_UTC = 7
-NOTIFY_MINUTE_UTC = 0
+KEYWORDS = [
+    "affordable glasses",
+    "cheap glasses",
+    "affordable eyeglasses",
+    "bifocals",
+    "progressive",
+    "prescription glasses",
+    "eyeglasses",
+    "prescription eyeglasses",
+    "sunglasses",
+    "prescription sunglasses",
+    "lenses",
+    "prescription lenses",
+    "lens options",
+    "tinted lens",
+    "progressive lens",
+    "bifocals lens",
+    "coating",
+    "blue light coating",
+]
 
 DEFAULT_SUBREDDITS = SUBREDDITS
 DEFAULT_INTERVAL_SECONDS = CHECK_INTERVAL_SECONDS
@@ -136,26 +161,21 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
         print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to send email: {exc}")
 
 
-def notification_time_today() -> datetime:
-    """Return today's notification time as a timezone-aware UTC datetime (12PM PKT = 7AM UTC)."""
-    now = datetime.now(timezone.utc)
-    return now.replace(hour=NOTIFY_HOUR_UTC, minute=NOTIFY_MINUTE_UTC, second=0, microsecond=0)
-
-
 def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECONDS, once: bool = False, keywords: list[str] | None = None) -> None:
     seen_ids: set[str] = set()
     collected_posts: list[dict[str, str]] = []
-    last_notification_date = None
+    last_notification_hour = None
+    next_iteration_time = time.monotonic()
     
     while True:
-        # Check if it's time to send notification
+        # Check if it's time to send notification (hourly)
         now = datetime.now(timezone.utc)
-        notify_time = notification_time_today()
-        if now >= notify_time and last_notification_date != now.date():
-            print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending daily notification...")
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        if last_notification_hour != current_hour:
+            print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending hourly notification...")
             send_email_notification(collected_posts)
             collected_posts = []  # Reset collection
-            last_notification_date = now.date()
+            last_notification_hour = current_hour
         
         # Fetch and process feeds
         feeds = fetch_multiple_subreddit_feeds(subreddits)
@@ -171,13 +191,21 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
                     for post in new_entries:
                         print(f"  - {post['title']} -> {post['link']}")
                         collected_posts.append(post)
+                        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Saved post: {post['title']}")
             except (KeyError, TypeError, ValueError) as exc:  # pragma: no cover - defensive catch for unexpected feed issues
                 print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Error checking r/{subreddit}: {exc}")
 
         if once:
             return
 
-        time.sleep(interval_seconds)
+        # Sleep for the remaining time to maintain consistent interval
+        next_iteration_time += interval_seconds
+        sleep_duration = next_iteration_time - time.monotonic()
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
+        else:
+            # If we're behind schedule, reset to prevent cascading delays
+            next_iteration_time = time.monotonic()
 
 
 def parse_args() -> argparse.Namespace:
