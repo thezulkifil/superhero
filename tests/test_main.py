@@ -1,5 +1,5 @@
 import unittest
-from app.main import get_new_entries
+from app.main import get_new_entries, parse_email_list
 
 
 class RedditFeedBotTests(unittest.TestCase):
@@ -30,6 +30,15 @@ class RedditFeedBotTests(unittest.TestCase):
         self.assertEqual(len(new_entries), 1)
         self.assertEqual(new_entries[0]["title"], "No ID here")
         self.assertIn("https://example.com/xyz", seen)
+
+    def test_parse_email_list_handles_commas_and_whitespace(self):
+        result = parse_email_list("a@example.com, b@example.com ,c@example.com")
+        self.assertEqual(result, ["a@example.com", "b@example.com", "c@example.com"])
+
+    def test_parse_email_list_handles_empty_values(self):
+        self.assertEqual(parse_email_list(None), [])
+        self.assertEqual(parse_email_list(""), [])
+        self.assertEqual(parse_email_list("  ,  "), [])
 
 
 if __name__ == "__main__":

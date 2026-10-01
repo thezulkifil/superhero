@@ -116,11 +116,19 @@ def get_new_entries(feed: dict[str, Any], seen_ids: set[str], keywords: list[str
     return new_entries
 
 
+def parse_email_list(raw: str | None) -> list[str]:
+    """Parse a comma-separated list of emails into a clean list."""
+    if not raw:
+        return []
+    return [addr.strip() for addr in raw.split(",") if addr.strip()]
+
+
 def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
     """Send email notification with collected posts via Brevo API."""
     api_key = os.getenv("BREVO_API_KEY")
     sender_email = os.getenv("SENDER_EMAIL")
     recipient_email = os.getenv("RECIPIENT_EMAIL")
+    cc_emails = parse_email_list(os.getenv("CC_EMAILS"))
     
     if not api_key or not sender_email or not recipient_email:
         print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email not configured. Skipping notification.")
@@ -147,6 +155,9 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
         "subject": subject,
         "htmlContent": html_body,
     }
+
+    if cc_emails:
+        payload["cc"] = [{"email": addr} for addr in cc_emails]
     
     try:
         response = requests.post(
@@ -156,7 +167,8 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
             timeout=30,
         )
         response.raise_for_status()
-        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email sent successfully to {recipient_email}")
+        cc_note = f" (cc: {', '.join(cc_emails)})" if cc_emails else ""
+        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email sent successfully to {recipient_email}{cc_note}")
     except requests.RequestException as exc:
         print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to send email: {exc}")
 
@@ -168,14 +180,18 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
     next_iteration_time = time.monotonic()
     
     while True:
-        # Check if it's time to send notification (hourly)
+        # Check if it's time to send notification (hourly, only when posts were found)
         now = datetime.now(timezone.utc)
         current_hour = now.replace(minute=0, second=0, microsecond=0)
         if last_notification_hour != current_hour:
-            print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending hourly notification...")
-            send_email_notification(collected_posts)
-            collected_posts = []  # Reset collection
-            last_notification_hour = current_hour
+            if collected_posts:
+                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending hourly notification with {len(collected_posts)} post(s)...")
+                send_email_notification(collected_posts)
+                collected_posts = []  # Reset collection
+                last_notification_hour = current_hour
+            else:
+                # Nothing collected yet this hour; retry next cycle without marking the hour as done
+                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] No posts collected, skipping hourly notification.")
         
         # Fetch and process feeds
         feeds = fetch_multiple_subreddit_feeds(subreddits)
