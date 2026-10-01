@@ -138,12 +138,14 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
         return
     
     # Build email content
-    subject = "Superhero: Here is your daily list."
+    post_count = len(collected_posts)
+    post_label = "post" if post_count == 1 else "posts"
+    subject = f"Superhero found {post_count} new {post_label}"
     
     if not collected_posts:
-        html_body = "<p>No matching posts found today.</p>"
+        html_body = "<p>No matching posts found.</p>"
     else:
-        html_body = f"<p>Found <strong>{len(collected_posts)}</strong> matching post(s) today:</p>"
+        html_body = f"<p>Found <strong>{post_count}</strong> matching {post_label}:</p>"
         html_body += "<ul>"
         for post in collected_posts:
             html_body += f'<li><a href="{post["link"]}">{post["title"]}</a></li>'
