@@ -23,8 +23,11 @@ SUBREDDITS = [
     "FrugalFemaleFashion",
     "FrugalMaleFashion",
 ]
-CHECK_INTERVAL_SECONDS = 300  # 5 minutes
-USER_AGENT = "superhero-bot/0.1"
+CHECK_INTERVAL_SECONDS = 600  # 10 min; covers 10 subreddits at 1 req/60s
+USER_AGENT = os.getenv("REDDIT_USER_AGENT", "python:superhero:1.0.0 (by /u/superhero_bot)")
+REQUEST_GAP_SECONDS = 60
+BASE_BACKOFF_SECONDS = 60
+MAX_BACKOFF_SECONDS = 900
 KEYWORDS = [
     "affordable glasses",
     "cheap glasses",
@@ -51,30 +54,98 @@ DEFAULT_INTERVAL_SECONDS = CHECK_INTERVAL_SECONDS
 DEFAULT_KEYWORDS = KEYWORDS
 
 
-def fetch_subreddit_feed(subreddit: str) -> dict[str, Any]:
+def log(message: str) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{timestamp}] {message}")
+
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/atom+xml,application/xml,text/xml,*/*",
+    }
+)
+
+
+class RateLimiter:
+    """Paces Reddit requests and escalates backoff when throttled.
+
+    The cooldown is shared across every request and persists between poll
+    cycles, so a 429 cannot be retried into a permanent lockout.
+    """
+
+    def __init__(
+        self,
+        gap: float = REQUEST_GAP_SECONDS,
+        base_backoff: float = BASE_BACKOFF_SECONDS,
+        max_backoff: float = MAX_BACKOFF_SECONDS,
+    ) -> None:
+        self.gap = gap
+        self.base_backoff = base_backoff
+        self.max_backoff = max_backoff
+        self.last_request_at = 0.0
+        self.consecutive_429 = 0
+        self.penalty_until = 0.0
+
+    def wait_turn(self) -> None:
+        """Block until it is safe to issue the next request."""
+        deadline = max(self.last_request_at + self.gap, self.penalty_until)
+        now = time.monotonic()
+        if deadline > now:
+            time.sleep(deadline - now)
+        self.last_request_at = time.monotonic()
+
+    def record_success(self) -> None:
+        self.consecutive_429 = 0
+        self.penalty_until = 0.0
+
+    def record_throttled(self, retry_after: str | None = None) -> float:
+        self.consecutive_429 += 1
+        delay = min(self.base_backoff * 2 ** (self.consecutive_429 - 1), self.max_backoff)
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        self.penalty_until = time.monotonic() + delay
+        return delay
+
+
+def fetch_subreddit_feed(subreddit: str, limiter: RateLimiter) -> dict[str, Any] | None:
     url = f"https://www.reddit.com/r/{subreddit}/.rss"
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
-    response.raise_for_status()
+    limiter.wait_turn()
+    response = SESSION.get(url, timeout=30)
+
+    if response.status_code == 429:
+        delay = limiter.record_throttled(response.headers.get("Retry-After"))
+        log(
+            f"Rate limited on r/{subreddit} (429), backing off "
+            f"{delay:.0f}s (attempt {limiter.consecutive_429})"
+        )
+        return None
+
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        log(f"Failed to fetch r/{subreddit}: {exc}")
+        return None
+
+    limiter.record_success()
     return feedparser.parse(response.text)
 
 
-def fetch_multiple_subreddit_feeds(subreddits: list[str]) -> list[tuple[str, dict[str, Any]]]:
+def fetch_multiple_subreddit_feeds(
+    subreddits: list[str], limiter: RateLimiter | None = None
+) -> list[tuple[str, dict[str, Any]]]:
+    limiter = limiter or RateLimiter()
     feeds = []
-    for i, subreddit in enumerate(subreddits):
-        try:
-            feed = fetch_subreddit_feed(subreddit)
+    for subreddit in subreddits:
+        feed = fetch_subreddit_feed(subreddit, limiter)
+        if feed is not None:
             feeds.append((subreddit, feed))
-        except requests.RequestException as exc:
-            if "429" in str(exc):
-                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Rate limited on r/{subreddit}, waiting 60s...")
-                time.sleep(60)
-            else:
-                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to fetch r/{subreddit}: {exc}")
-        
-        # Reddit RSS limit: 1 request per ~60 seconds
-        if i < len(subreddits) - 1:
-            time.sleep(60)
-    
+        else:
+            log(f"Skipping r/{subreddit} for this cycle")
     return feeds
 
 
@@ -131,8 +202,8 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
     cc_emails = parse_email_list(os.getenv("CC_EMAILS"))
     
     if not api_key or not sender_email or not recipient_email:
-        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email not configured. Skipping notification.")
-        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Collected {len(collected_posts)} posts:")
+        log("Email not configured. Skipping notification.")
+        log(f"Collected {len(collected_posts)} posts:")
         for post in collected_posts:
             print(f"  - {post['title']} -> {post['link']}")
         return
@@ -170,60 +241,64 @@ def send_email_notification(collected_posts: list[dict[str, str]]) -> None:
         )
         response.raise_for_status()
         cc_note = f" (cc: {', '.join(cc_emails)})" if cc_emails else ""
-        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Email sent successfully to {recipient_email}{cc_note}")
+        log(f"Email sent successfully to {recipient_email}{cc_note}")
     except requests.RequestException as exc:
-        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Failed to send email: {exc}")
+        log(f"Failed to send email: {exc}")
 
 
 def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECONDS, once: bool = False, keywords: list[str] | None = None) -> None:
     seen_ids: set[str] = set()
     collected_posts: list[dict[str, str]] = []
     last_notification_hour = None
-    next_iteration_time = time.monotonic()
+    limiter = RateLimiter()
     
     while True:
+        cycle_started_at = time.monotonic()
+
         # Check if it's time to send notification (hourly, only when posts were found)
         now = datetime.now(timezone.utc)
         current_hour = now.replace(minute=0, second=0, microsecond=0)
         if last_notification_hour != current_hour:
             if collected_posts:
-                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Sending hourly notification with {len(collected_posts)} post(s)...")
+                log(f"Sending hourly notification with {len(collected_posts)} post(s)...")
                 send_email_notification(collected_posts)
                 collected_posts = []  # Reset collection
                 last_notification_hour = current_hour
             else:
                 # Nothing collected yet this hour; retry next cycle without marking the hour as done
-                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] No posts collected, skipping hourly notification.")
+                log("No posts collected, skipping hourly notification.")
         
         # Fetch and process feeds
-        feeds = fetch_multiple_subreddit_feeds(subreddits)
+        feeds = fetch_multiple_subreddit_feeds(subreddits, limiter)
         
         for subreddit, feed in feeds:
             try:
                 new_entries = get_new_entries(feed, seen_ids, keywords)
 
                 if not new_entries:
-                    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] No new posts in r/{subreddit}.")
+                    log(f"No new posts in r/{subreddit}.")
                 else:
-                    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Found {len(new_entries)} new post(s) in r/{subreddit}:")
+                    log(f"Found {len(new_entries)} new post(s) in r/{subreddit}:")
                     for post in new_entries:
                         print(f"  - {post['title']} -> {post['link']}")
                         collected_posts.append(post)
-                        print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Saved post: {post['title']}")
+                        log(f"Saved post: {post['title']}")
             except (KeyError, TypeError, ValueError) as exc:  # pragma: no cover - defensive catch for unexpected feed issues
-                print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] Error checking r/{subreddit}: {exc}")
+                log(f"Error checking r/{subreddit}: {exc}")
 
         if once:
             return
 
         # Sleep for the remaining time to maintain consistent interval
-        next_iteration_time += interval_seconds
-        sleep_duration = next_iteration_time - time.monotonic()
+        elapsed = time.monotonic() - cycle_started_at
+        sleep_duration = interval_seconds - elapsed
         if sleep_duration > 0:
             time.sleep(sleep_duration)
         else:
-            # If we're behind schedule, reset to prevent cascading delays
-            next_iteration_time = time.monotonic()
+            log(
+                f"Cycle took {elapsed:.0f}s, exceeding {interval_seconds}s interval. "
+                f"Increasing --interval to at least {int(elapsed) + 60}s."
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -238,7 +313,7 @@ def parse_args() -> argparse.Namespace:
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
-        help="Polling interval in seconds. Default is 60.",
+        help="Polling interval in seconds. Default is 600 (10 minutes).",
     )
     parser.add_argument(
         "--once",
