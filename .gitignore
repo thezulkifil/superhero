@@ -1,6 +1,10 @@
 # Environment variables
 .env
 
+# Remembered post ids
+seen_ids.json
+seen_ids.json.tmp
+
 # Python
 __pycache__/
 *.py[cod]
