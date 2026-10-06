@@ -675,12 +675,61 @@ class KeywordPrefilterTests(unittest.TestCase):
         call.assert_not_called()
 
     def test_defaults_are_used_when_env_keyword_list_is_blank(self):
-        from app.main import KEYWORDS
+        from app.main import AMBIENT, KEYWORDS
 
-        self.assertIn("glasses", KEYWORDS)
+        self.assertIn("glass", KEYWORDS)
         self.assertIn("lens", KEYWORDS)
-        self.assertIn("repair", KEYWORDS)
-        self.assertNotIn("cheap", KEYWORDS)
+        self.assertIn("rx", KEYWORDS)
+        self.assertIn("repair", AMBIENT)
+        self.assertNotIn("repair", KEYWORDS)
+
+    def test_single_eyewear_term_is_enough(self):
+        from app.main import matches_keywords
+
+        post = self._post("a1", title="Anyone had their glasses repaired cheaply?")
+        self.assertTrue(matches_keywords(post, ["glass"], ["repair", "durable"]))
+
+    def test_lone_ambient_term_is_not_enough(self):
+        from app.main import matches_keywords
+
+        post = self._post("a1", title="I repaired my espresso machine")
+        self.assertFalse(matches_keywords(post, ["glass"], ["repair"]))
+
+    def test_two_ambient_terms_are_enough(self):
+        from app.main import matches_keywords
+
+        post = self._post("a1", title="Cheap durable repair kit that lasts")
+        self.assertTrue(
+            matches_keywords(post, ["glass"], ["repair", "durable", "cheapest"])
+        )
+
+    def test_backpack_post_is_rejected_by_defaults(self):
+        from app.main import AMBIENT, KEYWORDS, matches_keywords
+
+        post = self._post(
+            "a1",
+            title="BuyItForLife: my 10 year old backpack with a patch",
+            summary="durable and still going",
+        )
+        self.assertFalse(matches_keywords(post, KEYWORDS, AMBIENT))
+
+    def test_variations_are_caught_by_stems(self):
+        from app.main import matches_keywords
+
+        for title in ("cheap glasses", "eyeglasses tip", "sunglasses", "my lens cracked"):
+            self.assertTrue(matches_keywords(self._post("x", title=title), ["glass", "lens"]), title)
+
+    def test_rx_and_prescription_are_recognised(self):
+        from app.main import KEYWORDS, matches_keywords
+
+        for title in ("Is rx insurance worth it", "prescription renewal costs"):
+            self.assertTrue(matches_keywords(self._post("x", title=title), KEYWORDS), title)
+
+    def test_ambient_is_ignored_when_not_supplied(self):
+        from app.main import matches_keywords
+
+        post = self._post("a1", title="durable repair lasting deal")
+        self.assertFalse(matches_keywords(post, ["glass"]))
 
     def test_prompt_rules_out_subjective_appearance_questions(self):
         from app.main import RELEVANCE_SYSTEM_PROMPT

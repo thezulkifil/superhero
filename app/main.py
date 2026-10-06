@@ -139,36 +139,79 @@ RELEVANCE_RESPONSE_FORMATS: list[dict[str, Any] | None] = [
 ]
 _FORMAT_INDEX_BY_MODEL: dict[str, int] = {}
 
-# Cheap first pass so the model only ever sees plausible candidates. Matching is
-# a plain substring test, so single-word stems cover the variants: "glasses" also
-# catches sunglasses and eyeglasses, "lens" catches lens and lenses. Bare words
-# like "cheap" are deliberately absent because they flood from the frugality subs.
-# Cost words are left out on purpose, since almost every post there is cheap.
-DEFAULT_KEYWORDS = [
-    "glasses",
+# The keyword pass is a two-tier intake gate. A single eyewear term admits a
+# post on its own, which is what keeps intake high. Ambient words are far too
+# common on r/BuyItForLife and r/Frugal to admit anything, so they only count
+# when several of them agree. Matching is substring, so stems cover variants:
+# "glass" catches glasses and glassing, "lens" catches lens and lenses.
+EYEWEAR_KEYWORDS = [
+    "glass",
+    "eyeglass",
+    "spectacl",
+    "eyewear",
     "lens",
     "frame",
-    "eyewear",
-    "spectacle",
-    "bifocal",
-    "progressive",
-    "polarized",
+    "prescription",
+    "rx",
+    "optical",
     "coating",
+    "anti-reflective",
+    "blue light",
+    "bifocal",
+    "progressiv",
+    "polariz",
+    "single vision",
+    "reading glass",
+    "contact lens",
     "vision",
     "optician",
     "optometrist",
+    "optometry",
     "eye exam",
     "eye doctor",
-    "contact lens",
-    "repair",
-    "durable",
+    "eye test",
+    "contact",
+    "insert",
+    "varifocal",
 ]
 
-KEYWORDS = [
-    kw.strip().lower()
-    for kw in os.getenv("KEYWORDS", "").split(",")
-    if kw.strip()
-] or DEFAULT_KEYWORDS
+# Generic words that describe the topic only vaguely. One of these is not enough
+# on its own; a post needs several, or one of the eyewear terms above.
+AMBIENT_KEYWORDS = [
+    "repair",
+    "repairs",
+    "fix",
+    "fixing",
+    "broken",
+    "durable",
+    "lasts",
+    "lasting",
+    "cheap",
+    "cheapest",
+    "budget",
+    "bargain",
+    "worth it",
+    "deal",
+    "value",
+    "sharpener",
+    "tool",
+    "tools",
+]
+AMBIENT_MATCHES_REQUIRED = 2
+
+
+def _keyword_list(env_name: str, defaults: list[str]) -> list[str]:
+    """Read a comma-separated keyword override, falling back to the defaults."""
+    override = [
+        keyword.strip().lower()
+        for keyword in os.getenv(env_name, "").split(",")
+        if keyword.strip()
+    ]
+    return override or [keyword.lower() for keyword in defaults]
+
+
+KEYWORDS = _keyword_list("KEYWORDS", EYEWEAR_KEYWORDS)
+AMBIENT = _keyword_list("AMBIENT_KEYWORDS", AMBIENT_KEYWORDS)
 
 DEFAULT_SUBREDDITS = SUBREDDITS
 DEFAULT_INTERVAL_SECONDS = CHECK_INTERVAL_SECONDS
@@ -329,10 +372,22 @@ def strip_html(text: str) -> str:
     return re.sub(r"\s+", " ", without_tags).strip()
 
 
-def matches_keywords(post: Post, keywords: list[str]) -> bool:
-    """First-pass filter on title and summary text."""
+def matches_keywords(post: Post, keywords: list[str], ambient: list[str] | None = None) -> bool:
+    """First-pass filter on title and summary text.
+
+    One eyewear term is enough. Ambient terms only admit a post when several of
+    them agree, so a lone "repair" in a toaster thread does not get promoted.
+    """
     haystack = f"{post.get('title', '')} {post.get('summary', '')}".lower()
-    return any(keyword.lower() in haystack for keyword in keywords)
+
+    if any(keyword.lower() in haystack for keyword in keywords):
+        return True
+
+    if not ambient:
+        return False
+
+    hits = {keyword for keyword in ambient if keyword.lower() in haystack}
+    return len(hits) >= AMBIENT_MATCHES_REQUIRED
 
 
 def build_relevance_payload(
@@ -755,7 +810,11 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
                     continue
 
                 log(f"Found {len(entries)} new post(s) in r/{subreddit}.")
-                hits = [post for post in entries if matches_keywords(post, keywords)]
+                hits = [
+                    post
+                    for post in entries
+                    if matches_keywords(post, keywords, AMBIENT)
+                ]
                 if len(hits) < len(entries):
                     log(f"{len(hits)}/{len(entries)} matched a keyword.")
 
