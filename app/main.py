@@ -61,7 +61,20 @@ SUMMARY_MAX_CHARS = 600
 # retries recover batches that would otherwise be dropped for good.
 RELEVANCE_RETRY_DELAYS = (20.0, 40.0)
 
-SEEN_IDS_PATH = os.getenv("SEEN_IDS_PATH", "seen_ids.json")
+def resolve_seen_ids_path() -> str:
+    """Pick where to remember post ids.
+
+    Railway injects RAILWAY_VOLUME_MOUNT_PATH pointing at the attached volume,
+    so prefer that over hardcoding a path. Do not set RAILWAY_VOLUME_MOUNT_PATH
+    by hand, Railway overwrites it.
+    """
+    volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if volume_path:
+        return os.path.join(volume_path.rstrip("/"), "seen_ids.json")
+    return "seen_ids.json"
+
+
+SEEN_IDS_PATH = os.getenv("SEEN_IDS_PATH", "").strip() or resolve_seen_ids_path()
 SEEN_IDS_MAX = 5000
 
 DEFAULT_SUBREDDIT_INTERVAL_SECONDS = 600

@@ -850,5 +850,27 @@ class SubredditIntervalTests(unittest.TestCase):
         self.assertNotIn("Frugal".lower(), main.SUBREDDIT_INTERVAL_SECONDS)
 
 
+class SeenIdsPathTests(unittest.TestCase):
+    def _resolve(self, env):
+        from app import main
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            return main.resolve_seen_ids_path()
+
+    def test_falls_back_to_relative_path_locally(self):
+        self.assertEqual(self._resolve({}), "seen_ids.json")
+
+    def test_uses_railway_volume_mount_path(self):
+        resolved = self._resolve({"RAILWAY_VOLUME_MOUNT_PATH": "/data"})
+        self.assertEqual(resolved.replace("\\", "/"), "/data/seen_ids.json")
+
+    def test_handles_trailing_slash_on_mount_path(self):
+        resolved = self._resolve({"RAILWAY_VOLUME_MOUNT_PATH": "/data/"})
+        self.assertEqual(resolved.replace("\\", "/"), "/data/seen_ids.json")
+
+    def test_ignores_blank_mount_path(self):
+        self.assertEqual(self._resolve({"RAILWAY_VOLUME_MOUNT_PATH": "  "}), "seen_ids.json")
+
+
 if __name__ == "__main__":
     unittest.main()
