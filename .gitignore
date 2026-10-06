@@ -4,6 +4,9 @@
 # Remembered post ids
 seen_ids.json
 seen_ids.json.tmp
+superhero_seen_ids.json
+business_seen_ids.json
+*.seen.json.tmp
 
 # Python
 __pycache__/

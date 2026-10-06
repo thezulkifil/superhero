@@ -346,7 +346,7 @@ class RelevanceFilterTests(unittest.TestCase):
     def test_filter_batches_large_sets_and_unions_results(self):
         posts = self._posts("a1", "a2", "a3", "a4", "a5")
 
-        def fake_request(batch, model):
+        def fake_request(batch, model, timeout=60, prompt=""):
             return {batch[0]["id"]}
 
         with mock.patch("app.main.RELEVANCE_BATCH_SIZE", 2):

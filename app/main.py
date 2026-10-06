@@ -11,6 +11,9 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
+from app.bots import BOTS, DEFAULT_BOT, get_bot
+from app.config import BotConfig
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -231,6 +234,27 @@ SESSION.headers.update(
     }
 )
 
+# Reddit expects one User-Agent per application, so each bot gets its own
+# connection pool. SESSIONS_BY_AGENT caches them to keep connections alive.
+SESSIONS_BY_AGENT: dict[str, requests.Session] = {}
+
+
+def get_session(user_agent: str) -> requests.Session:
+    """Return a pooled session for a given User-Agent."""
+    if user_agent == USER_AGENT:
+        return SESSION
+    session = SESSIONS_BY_AGENT.get(user_agent)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept": "application/atom+xml,application/xml,text/xml,*/*",
+            }
+        )
+        SESSIONS_BY_AGENT[user_agent] = session
+    return session
+
 # Shared by the Groq and Brevo calls so neither pays a fresh TLS handshake.
 API_SESSION = requests.Session()
 API_SESSION.headers.update({"Content-Type": "application/json", "User-Agent": USER_AGENT})
@@ -280,7 +304,11 @@ class RateLimiter:
         return delay
 
 
-def fetch_subreddit_feed(subreddit: str, limiter: RateLimiter) -> dict[str, Any] | None:
+def fetch_subreddit_feed(
+    subreddit: str,
+    limiter: RateLimiter,
+    user_agent: str = USER_AGENT,
+) -> dict[str, Any] | None:
     """Fetch one feed, tolerating transient network failures.
 
     Retrying matters more than it looks: a slow subreddit is only polled once an
@@ -292,7 +320,7 @@ def fetch_subreddit_feed(subreddit: str, limiter: RateLimiter) -> dict[str, Any]
     for delay in (*FETCH_RETRY_DELAYS, None):
         limiter.wait_turn()
         try:
-            response = SESSION.get(url, timeout=30)
+            response = get_session(user_agent).get(url, timeout=30)
         except requests.RequestException as exc:
             # Connection resets and read timeouts land here. Without this the
             # exception escapes run_bot and takes the whole bot down.
@@ -330,6 +358,7 @@ def fetch_due_subreddit_feeds(
     limiter: RateLimiter,
     last_fetched: dict[str, float],
     intervals: dict[str, int] | None = None,
+    user_agent: str = USER_AGENT,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Fetch only the subreddits whose own polling interval has elapsed.
 
@@ -348,7 +377,7 @@ def fetch_due_subreddit_feeds(
             log(f"r/{subreddit} is not due yet, skipping for {interval - elapsed:.0f}s.")
             continue
 
-        feed = fetch_subreddit_feed(subreddit, limiter)
+        feed = fetch_subreddit_feed(subreddit, limiter, user_agent)
         last_fetched[key] = time.monotonic()
         if feed is not None:
             feeds.append((subreddit, feed))
@@ -391,7 +420,10 @@ def matches_keywords(post: Post, keywords: list[str], ambient: list[str] | None 
 
 
 def build_relevance_payload(
-    posts: list[Post], model: str, response_format: dict[str, Any] | None
+    posts: list[Post],
+    model: str,
+    response_format: dict[str, Any] | None,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
 ) -> dict[str, Any]:
     """Build a Groq chat-completions request for one batch of posts.
 
@@ -410,7 +442,7 @@ def build_relevance_payload(
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
+            {"role": "system", "content": prompt},
             {
                 "role": "user",
                 "content": (
@@ -476,7 +508,10 @@ class _RateLimited(Exception):
 
 
 def request_relevant_ids(
-    posts: list[Post], model: str, timeout: int = RELEVANCE_TIMEOUT_SECONDS
+    posts: list[Post],
+    model: str,
+    timeout: int = RELEVANCE_TIMEOUT_SECONDS,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
 ) -> set[str] | None:
     """Ask the model which posts in one batch are relevant.
 
@@ -494,7 +529,9 @@ def request_relevant_ids(
     # The final None marks the last attempt, which does not sleep afterwards.
     for delay in (*RELEVANCE_RETRY_DELAYS, None):
         try:
-            return _attempt_relevance_formats(posts, model, headers, known_ids, timeout)
+            return _attempt_relevance_formats(
+                posts, model, headers, known_ids, timeout, prompt
+            )
         except _RateLimited:
             if delay is None:
                 log("Groq kept rate limiting us; skipping this batch.")
@@ -511,6 +548,7 @@ def _attempt_relevance_formats(
     headers: dict[str, str],
     known_ids: set[str],
     timeout: int,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
 ) -> set[str] | None:
     """Try each request shape once against the model."""
     start = _FORMAT_INDEX_BY_MODEL.get(model, 0)
@@ -522,7 +560,7 @@ def _attempt_relevance_formats(
             response = API_SESSION.post(
                 GROQ_URL,
                 headers=headers,
-                json=build_relevance_payload(posts, model, response_format),
+                json=build_relevance_payload(posts, model, response_format, prompt),
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -564,7 +602,9 @@ def _is_shape_rejection(exc: requests.HTTPError) -> bool:
 
 
 def filter_relevant_posts(
-    posts: list[Post], model: str = DEFAULT_RELEVANCE_MODEL
+    posts: list[Post],
+    model: str = DEFAULT_RELEVANCE_MODEL,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
 ) -> set[str]:
     """Return the ids of posts a small reasoning model judges relevant.
 
@@ -577,7 +617,7 @@ def filter_relevant_posts(
     relevant: set[str] = set()
     for start in range(0, len(posts), RELEVANCE_BATCH_SIZE):
         batch = posts[start : start + RELEVANCE_BATCH_SIZE]
-        batch_ids = request_relevant_ids(batch, model)
+        batch_ids = request_relevant_ids(batch, model, RELEVANCE_TIMEOUT_SECONDS, prompt)
         if batch_ids is None:
             log(f"Skipping {len(batch)} post(s) that could not be filtered.")
             continue
@@ -715,11 +755,15 @@ def build_email_subject(posts: list[Post]) -> str:
     return f"Superhero found {relevant_count} new {label}"
 
 
-def send_email_notification(collected_posts: list[Post]) -> None:
+def send_email_notification(
+    collected_posts: list[Post],
+    recipient_email: str | None = None,
+    sender_email: str | None = None,
+) -> None:
     """Send email notification with collected posts via Brevo API."""
     api_key = os.getenv("BREVO_API_KEY")
-    sender_email = os.getenv("SENDER_EMAIL")
-    recipient_email = os.getenv("RECIPIENT_EMAIL")
+    sender_email = sender_email or os.getenv("SENDER_EMAIL")
+    recipient_email = recipient_email or os.getenv("RECIPIENT_EMAIL")
     cc_emails = parse_email_list(os.getenv("CC_EMAILS"))
 
     if not api_key or not sender_email or not recipient_email:
@@ -757,9 +801,23 @@ def send_email_notification(collected_posts: list[Post]) -> None:
         log(f"Failed to send email: {exc}")
 
 
-def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECONDS, once: bool = False, relevance_model: str = DEFAULT_RELEVANCE_MODEL, keywords: list[str] | None = None) -> None:
+def run_bot(
+    subreddits: list[str],
+    interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+    once: bool = False,
+    relevance_model: str = DEFAULT_RELEVANCE_MODEL,
+    keywords: list[str] | None = None,
+    *,
+    ambient: list[str] | None = None,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
+    user_agent: str = USER_AGENT,
+    seen_ids_path: str = SEEN_IDS_PATH,
+    subreddit_intervals: dict[str, int] | None = None,
+    recipient_email: str | None = None,
+) -> None:
     keywords = list(keywords or KEYWORDS)
-    seen_ids = load_seen_ids(SEEN_IDS_PATH)
+    ambient = list(ambient or [])
+    seen_ids = load_seen_ids(seen_ids_path)
     if seen_ids:
         log(f"Remembered {len(seen_ids)} previously seen post(s).")
     collected_posts: list[Post] = []
@@ -777,7 +835,7 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
             if any(post["relevant"] for post in collected_posts):
                 kept = sum(1 for post in collected_posts if post["relevant"])
                 log(f"Sending hourly notification with {kept} relevant of {len(collected_posts)} post(s)...")
-                send_email_notification(collected_posts)
+                send_email_notification(collected_posts, recipient_email)
                 collected_posts = []  # Reset collection
                 last_notification_hour = current_hour
             else:
@@ -786,7 +844,9 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
         
         # Fetch every due feed, then judge them in one pass so the model sees a
         # single batch per cycle instead of one request per subreddit.
-        feeds = fetch_due_subreddit_feeds(subreddits, limiter, last_fetched)
+        feeds = fetch_due_subreddit_feeds(
+            subreddits, limiter, last_fetched, subreddit_intervals, user_agent
+        )
 
         new_entries: list[Post] = []
         candidates: list[Post] = []
@@ -815,7 +875,9 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
 
         if candidates:
             log(f"Asking the model about {len(candidates)} candidate post(s)...")
-            relevant_ids = filter_relevant_posts(candidates, relevance_model)
+            relevant_ids = filter_relevant_posts(
+                candidates, relevance_model, prompt
+            )
         else:
             relevant_ids = set()
 
@@ -830,7 +892,7 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
 
             # Keep every post so the email toggle can reveal what was filtered out.
             collected_posts.extend(new_entries)
-            save_seen_ids(SEEN_IDS_PATH, seen_ids)
+            save_seen_ids(seen_ids_path, seen_ids)
             log(f"{len(kept)}/{len(new_entries)} post(s) were relevant.")
 
         if once:
@@ -848,21 +910,27 @@ def run_bot(subreddits: list[str], interval_seconds: int = DEFAULT_INTERVAL_SECO
             )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Poll Reddit subreddit RSS feeds and keep the posts a model considers relevant."
     )
     parser.add_argument(
+        "--bot",
+        default=DEFAULT_BOT,
+        choices=sorted(BOTS),
+        help=f"Which listener to run. One of: {', '.join(sorted(BOTS))}.",
+    )
+    parser.add_argument(
         "--subreddits",
         nargs="+",
-        default=DEFAULT_SUBREDDITS,
-        help="Reddit subreddits to monitor, e.g. glasses glassesadvice optometry",
+        default=None,
+        help="Override the bot's subreddit list.",
     )
     parser.add_argument(
         "--interval",
         type=int,
-        default=DEFAULT_INTERVAL_SECONDS,
-        help="Polling interval in seconds. Default is 600 (10 minutes).",
+        default=None,
+        help="Polling interval in seconds. Defaults to the bot's own setting.",
     )
     parser.add_argument(
         "--once",
@@ -871,21 +939,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--relevance-model",
-        default=DEFAULT_RELEVANCE_MODEL,
-        help=(
-            "Groq model used to judge whether a post is relevant. "
-            f"Default is {DEFAULT_RELEVANCE_MODEL}."
-        ),
+        default=None,
+        help="Groq model used to judge relevance. Defaults to the bot's own setting.",
     )
     parser.add_argument(
         "--keywords",
         nargs="+",
-        default=KEYWORDS,
-        help="Keywords for the first-pass filter (case-insensitive). The model checks these.",
+        default=None,
+        help="Override the first-pass keyword list (case-insensitive).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    config = get_bot(args.bot)
+
+    run_bot(
+        args.subreddits or config.subreddits,
+        args.interval or config.cycle_interval,
+        args.once,
+        args.relevance_model or config.relevance_model,
+        args.keywords or config.keywords,
+        ambient=config.ambient_keywords,
+        prompt=config.relevance_prompt,
+        user_agent=config.user_agent,
+        seen_ids_path=config.seen_ids_path,
+        subreddit_intervals=config.subreddit_intervals,
+        recipient_email=config.recipient_email,
+    )
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run_bot(args.subreddits, args.interval, args.once, args.relevance_model, args.keywords)
+    main()
