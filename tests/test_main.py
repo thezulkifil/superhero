@@ -548,7 +548,7 @@ class RelevanceFilterTests(unittest.TestCase):
         self.assertIn("glasses", SUBREDDITS)
 
 
-class EmailToggleTests(unittest.TestCase):
+class EmailDigestLayoutTests(unittest.TestCase):
     def _post(self, post_id, relevant, title=None):
         return {
             "id": post_id,
@@ -558,45 +558,41 @@ class EmailToggleTests(unittest.TestCase):
             "relevant": relevant,
         }
 
-    def test_default_view_shows_only_relevant_posts(self):
+    def test_relevant_posts_are_listed_first(self):
         body = build_email_html([self._post("a1", True), self._post("b2", False)])
-        filtered = body.split('class="sh-filtered"')[1].split('class="sh-all"')[0]
-        self.assertIn("Post a1", filtered)
-        self.assertNotIn("Post b2", filtered)
+        self.assertLess(body.index("Post a1"), body.index("Post b2"))
 
-    def test_all_view_contains_every_post(self):
+    def test_filtered_posts_are_still_present(self):
         body = build_email_html([self._post("a1", True), self._post("b2", False)])
-        all_view = body.split('class="sh-all"')[1]
-        self.assertIn("Post a1", all_view)
-        self.assertIn("Post b2", all_view)
+        self.assertIn("Post a1", body)
+        self.assertIn("Post b2", body)
 
-    def test_toggle_is_unchecked_by_default(self):
-        body = build_email_html([self._post("a1", True), self._post("b2", False)])
-        checkbox = body.split('<input type="checkbox"')[1].split(">")[0]
-        self.assertNotIn("checked", checkbox)
-
-    def test_css_hides_all_view_until_toggled(self):
-        body = build_email_html([self._post("a1", True), self._post("b2", False)])
-        self.assertIn(".sh-all{display:none}", body)
-        self.assertIn(".sh-toggle:checked~.sh-all{display:block}", body)
-        self.assertIn(".sh-toggle:checked~.sh-filtered{display:none}", body)
-
-    def test_toggle_labels_hidden_count(self):
+    def test_no_interactive_controls_are_emitted(self):
+        # Gmail strips form inputs and does not support :checked on any platform,
+        # so a checkbox toggle could never work there. Keep the markup client-safe.
         body = build_email_html(
             [self._post("a1", True), self._post("b2", False), self._post("c3", False)]
         )
-        self.assertIn("Show all 3 posts", body)
-        self.assertIn("(2 filtered out)", body)
+        self.assertNotIn("<input", body)
+        self.assertNotIn("<label", body)
+        self.assertNotIn(":checked", body)
+        self.assertNotIn("<style", body)
 
-    def test_filtered_out_posts_are_marked_in_all_view(self):
+    def test_filtered_section_reports_the_count(self):
+        body = build_email_html(
+            [self._post("a1", True), self._post("b2", False), self._post("c3", False)]
+        )
+        self.assertIn("All 3 posts", body)
+        self.assertIn("including the 2 the filter passed over", body)
+
+    def test_filtered_posts_are_visually_secondary(self):
         body = build_email_html([self._post("a1", True), self._post("b2", False)])
-        self.assertIn("(filtered out)", body)
+        self.assertIn("color:#666666", body.split("Post b2")[0])
 
-    def test_no_toggle_when_nothing_was_filtered(self):
+    def test_no_secondary_section_when_nothing_was_filtered(self):
         body = build_email_html([self._post("a1", True), self._post("b2", True)])
-        self.assertNotIn('type="checkbox"', body)
-        self.assertNotIn('class="sh-filtered"', body)
-        self.assertNotIn('class="sh-all"', body)
+        self.assertNotIn("passed over", body)
+        self.assertNotIn("<hr", body)
         self.assertIn("Post a1", body)
         self.assertIn("Post b2", body)
 

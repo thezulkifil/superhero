@@ -652,70 +652,60 @@ def parse_email_list(raw: str | None) -> list[str]:
     return [addr.strip() for addr in raw.split(",") if addr.strip()]
 
 
-def render_post_list(posts: list[Post], show_verdict: bool) -> str:
-    """Render posts as a linked list, optionally tagging the filtered ones."""
+def render_post_list(posts: list[Post], muted: bool = False) -> str:
+    """Render posts as a linked list, optionally dimmed as secondary content."""
+    color = "#666666" if muted else "#1155cc"
+    size = "13px" if muted else "15px"
     items = []
     for post in posts:
         title = html.escape(post.get("title") or "(untitled)")
         link = html.escape(post.get("link") or "", quote=True)
-        verdict = ""
-        if show_verdict and not post.get("relevant"):
-            verdict = ' <span style="color:#888;">(filtered out)</span>'
-        items.append(f'<li style="margin:0 0 8px;"><a href="{link}" style="color:#1155cc;">{title}</a>{verdict}</li>')
+        items.append(
+            f'<li style="margin:0 0 6px;">'
+            f'<a href="{link}" style="color:{color};font-size:{size};">{title}</a></li>'
+        )
     if not items:
-        return "<p>Nothing to show.</p>"
+        return ""
     return f'<ul style="margin:0;padding-left:20px;">{"".join(items)}</ul>'
 
 
-# A checkbox and the :checked sibling selector is the only toggle that survives
-# email clients, which strip scripts. Unchecked by default, so the filtered list
-# is what everyone sees; clients without :checked support simply keep it that way.
-EMAIL_CSS = """
-.sh-toggle{position:absolute;opacity:0;width:1px;height:1px;overflow:hidden}
-.sh-all{display:none}
-.sh-toggle:checked~.sh-all{display:block}
-.sh-toggle:checked~.sh-filtered{display:none}
-.sh-btn{display:inline-block;padding:8px 14px;border:1px solid #ccc;border-radius:6px;
-background:#f6f6f6;color:#333;font-size:13px;cursor:pointer}
-"""
-
-
 def build_email_html(posts: list[Post]) -> str:
-    """Build the digest body: filtered posts by default, all posts behind a toggle."""
+    """Build the digest body: relevant posts first, then the filtered remainder.
+
+    There is no interactive toggle. Gmail strips form inputs and does not support
+    the :checked pseudo-class on any platform, so a checkbox toggle can never work
+    there and it also strips the id and class attributes the selector relies on.
+    The filtered posts therefore sit below a divider in muted text instead of
+    behind a control that silently does nothing.
+    """
     relevant = [post for post in posts if post.get("relevant")]
+    filtered = [post for post in posts if not post.get("relevant")]
     total = len(posts)
     relevant_label = "post" if len(relevant) == 1 else "posts"
     total_label = "post" if total == 1 else "posts"
-    hidden = total - len(relevant)
 
     intro = (
-        f"<p>Found <strong>{len(relevant)}</strong> relevant {relevant_label}"
-        f" out of {total} seen this hour.</p>"
+        f"<p>Found <strong>{len(relevant)}</strong> relevant {relevant_label} "
+        f"out of {total} seen this hour.</p>"
     )
 
     if not relevant:
-        body = "<p>No relevant posts found.</p>"
-        toggle = ""
-    elif hidden == 0:
-        body = render_post_list(relevant, show_verdict=False)
-        toggle = ""
+        sections = "<p>No relevant posts found.</p>"
     else:
-        toggle = (
-            f'<input type="checkbox" id="shAll" class="sh-toggle">'
-            f'<p style="margin:16px 0 8px;">'
-            f'<label for="shAll" class="sh-btn">Show all {total} {total_label} '
-            f"({hidden} filtered out)</label></p>"
-        )
-        body = (
-            f'<div class="sh-filtered">{render_post_list(relevant, show_verdict=False)}</div>'
-            f'<div class="sh-all">{render_post_list(posts, show_verdict=True)}</div>'
-        )
+        sections = render_post_list(relevant)
+        if filtered:
+            divider = (
+                '<hr style="border:none;border-top:1px solid #e0e0e0;margin:20px 0 12px;">'
+                f'<p style="color:#888;font-size:12px;margin:0 0 8px;">'
+                f"All {total} {total_label}, including the {len(filtered)} "
+                f"the filter passed over:</p>"
+            )
+            sections += divider + render_post_list(filtered, muted=True)
 
     return (
-        f"<style>{EMAIL_CSS}</style>"
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
         f'color:#1a1a1a;font-size:15px;line-height:1.5;">'
-        f"{intro}{toggle}{body}</div>"
+        f"{intro}{sections}</div>"
     )
 
 
