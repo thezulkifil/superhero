@@ -88,7 +88,7 @@ class EnvScopingTests(unittest.TestCase):
 
     def test_env_int_ignores_garbage(self):
         with mock.patch.dict("os.environ", {"BUSINESS_INTERVAL": "soon"}, clear=True):
-            self.assertEqual(BUSINESS.cycle_interval, 600)
+            self.assertEqual(BUSINESS.cycle_interval, BUSINESS.default_interval)
 
     def test_env_int_parses_numbers(self):
         with mock.patch.dict("os.environ", {"BUSINESS_INTERVAL": "900"}, clear=True):
@@ -141,6 +141,50 @@ class LeadGenPromptTests(unittest.TestCase):
         self.assertEqual(BUSINESS.subreddit_intervals, {})
 
 
+class SweepBudgetTests(unittest.TestCase):
+    def test_sweep_is_gap_times_subreddit_count(self):
+        config = BotConfig(
+            name="x", user_agent="python:x:1.0", env_prefix="X_", subreddits=["a"] * 5
+        )
+        self.assertEqual(config.sweep_seconds, 4 * 60)
+
+    def test_single_subreddit_needs_no_sweep_gap(self):
+        config = BotConfig(
+            name="x", user_agent="python:x:1.0", env_prefix="X_", subreddits=["a"]
+        )
+        self.assertEqual(config.sweep_seconds, 0)
+
+    def test_every_bot_fits_its_own_interval(self):
+        # Otherwise the cycle overruns and the sweep silently rotates instead.
+        for config in BOTS.values():
+            self.assertLessEqual(
+                config.sweep_seconds,
+                config.cycle_interval,
+                f"{config.name} cannot finish a sweep in one cycle",
+            )
+
+    def test_business_bot_uses_a_longer_interval_than_superhero(self):
+        self.assertGreater(BUSINESS.cycle_interval, SUPERHERO.cycle_interval)
+
+
+class BusinessSubredditTests(unittest.TestCase):
+    def test_covers_owner_pain_subs(self):
+        for sub in ("smallbusiness", "smallbusinessadvice", "Entrepreneur"):
+            self.assertIn(sub, BUSINESS.subreddits)
+
+    def test_covers_service_categories(self):
+        for sub in ("web_design", "seo", "branding", "marketing"):
+            self.assertIn(sub, BUSINESS.subreddits)
+
+    def test_no_duplicate_subreddits(self):
+        lowered = [sub.lower() for sub in BUSINESS.subreddits]
+        self.assertEqual(len(lowered), len(set(lowered)))
+
+    def test_eyewear_subs_are_not_present(self):
+        for sub in ("glasses", "optometry", "glassesadvice"):
+            self.assertNotIn(sub, BUSINESS.subreddits)
+
+
 class ConfigDefaultsTests(unittest.TestCase):
     def test_empty_config_is_usable(self):
         config = BotConfig(
@@ -149,6 +193,17 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.cycle_interval, 600)
         self.assertEqual(config.relevance_model, "openai/gpt-oss-20b")
         self.assertEqual(config.seen_ids_path, "seen_ids.json")
+
+    def test_default_interval_can_be_overridden_per_bot(self):
+        config = BotConfig(
+            name="x",
+            user_agent="python:x:1.0",
+            env_prefix="X_",
+            subreddits=["a"],
+            default_interval=1800,
+        )
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(config.cycle_interval, 1800)
 
     def test_intervals_default_to_empty(self):
         config = BotConfig(

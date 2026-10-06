@@ -43,23 +43,33 @@ BUSINESS = BotConfig(
     user_agent="python:businessleads:1.0.0 (by /u/superhero_bot)",
     env_prefix="BUSINESS_",
     subreddits=[
+        # Owner-pain subs, the densest source of people with a real problem.
         "smallbusiness",
         "smallbusinessadvice",
         "Entrepreneur",
         "EntrepreneurRideAlong",
+        # Product and commerce businesses that buy services by default.
         "startups",
         "SaaS",
         "EtsySellers",
         "Shopify",
         "ecommerce",
+        "printondemand",
+        # The service categories themselves, where prospects ask directly.
         "marketing",
         "branding",
         "logodesign",
+        "seo",
+        "PPC",
         "web_design",
+        "webdev",
         "freelance",
+        "agencies",
     ],
     # Every sub stays on the fast cadence. A lead an hour late is one that
-    # someone else has already answered.
+    # someone else has already answered. At this breadth the cycle is paced by
+    # Reddit's 1 req/60s rather than by the work, so keep the interval at 600 and
+    # let the RateLimiter hold the line.
     subreddit_intervals={},
     keywords=[
         "need",
@@ -150,5 +160,8 @@ BUSINESS = BotConfig(
         "platform",
     ],
     relevance_prompt=RELEVANCE_PROMPT,
+    # Nineteen subreddits at one request per minute need eighteen minutes to
+    # sweep. A shorter interval would overrun every cycle.
+    default_interval=1200,
     default_seen_ids_file="business_seen_ids.json",
 )

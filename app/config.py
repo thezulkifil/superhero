@@ -14,6 +14,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+#: Reddit's RSS rate limit for these feeds, in seconds between requests.
+REQUEST_GAP_SECONDS = 60
+
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -35,6 +38,10 @@ class BotConfig:
 
     #: Instructions for the relevance model, written for this bot's purpose.
     relevance_prompt: str = ""
+
+    #: Polling cycle length in seconds. Must be long enough to fetch every
+    #: subreddit at the rate limit, or the cycle overruns and logs a warning.
+    default_interval: int = 600
 
     #: Filename used when SEEN_IDS_PATH is not set in the environment.
     default_seen_ids_file: str = "seen_ids.json"
@@ -72,4 +79,9 @@ class BotConfig:
 
     @property
     def cycle_interval(self) -> int:
-        return self.env_int("INTERVAL", 600)
+        return self.env_int("INTERVAL", self.default_interval)
+
+    @property
+    def sweep_seconds(self) -> int:
+        """Seconds a full pass over every subreddit costs, at one request per gap."""
+        return max(0, len(self.subreddits) - 1) * REQUEST_GAP_SECONDS
