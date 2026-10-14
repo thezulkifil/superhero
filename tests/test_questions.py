@@ -787,5 +787,122 @@ class DailyQuestionListTests(unittest.TestCase):
         send.assert_not_called()
 
 
+class QuestionRecipientTests(unittest.TestCase):
+    """The guide list is one person's work queue and must stay that way."""
+
+    _ENV = {
+        "BREVO_API_KEY": "test-key",
+        "SENDER_EMAIL": "support@ollglasses.com",
+        "RECIPIENT_EMAIL": "digest@example.com",
+        "QUESTIONS_RECIPIENT_EMAIL": "writer@example.com",
+        # The post digest cc's several people. The guide list must not.
+        "CC_EMAILS": "someone@example.com, another@example.com",
+    }
+
+    def _entry(self, question="How much is an eye exam?"):
+        return {
+            "key": question_key(question),
+            "question": question,
+            "asked": 1,
+            "first_seen": "t",
+            "last_seen": "t",
+            "sent_on": "",
+            "examples": [],
+        }
+
+    def _sent_payload(self, questions_email, env=None):
+        """Run the real send path and return the payload Brevo was handed."""
+        path = _path()
+        entry = self._entry()
+        save_questions(path, {entry["key"]: entry})
+
+        sent = mock.Mock()
+        sent.status_code = 200
+        sent.raise_for_status.return_value = None
+
+        with mock.patch.dict("os.environ", env or self._ENV, clear=True):
+            with mock.patch("app.main.datetime") as clock:
+                clock.now.return_value = datetime(2026, 10, 14, 23, 5, tzinfo=timezone.utc)
+                with mock.patch("app.main.fetch_due_subreddit_feeds", return_value=[]):
+                    with mock.patch("app.main.API_SESSION.post", return_value=sent) as post:
+                        main.run_bot(
+                            ["glasses"],
+                            once=True,
+                            collect_questions=True,
+                            questions_path=path,
+                            questions_email=questions_email,
+                        )
+
+        return post.call_args.kwargs["json"]
+
+    def test_the_cli_hands_run_bot_the_configured_recipient(self):
+        with mock.patch.dict("os.environ", self._ENV, clear=True):
+            with mock.patch("app.main.run_bot") as run:
+                main.main(["--bot", "superhero"])
+
+        self.assertEqual(run.call_args.kwargs["questions_email"], "writer@example.com")
+
+    def test_the_list_goes_only_to_the_questions_recipient(self):
+        from app.bots import SUPERHERO
+
+        with mock.patch.dict("os.environ", self._ENV, clear=True):
+            recipient = SUPERHERO.questions_recipient_email
+
+        payload = self._sent_payload(recipient)
+
+        self.assertEqual(payload["to"], [{"email": "writer@example.com"}])
+
+    def test_the_list_never_inherits_the_digest_cc_list(self):
+        # A cc here would leak the work queue to everyone on the post digest.
+        payload = self._sent_payload("writer@example.com")
+
+        self.assertNotIn("cc", payload)
+
+    def test_it_falls_back_to_the_digest_recipient_when_unset(self):
+        # Without the dedicated setting the list goes to whoever gets the post
+        # digest, since that is the same person deciding what to write about.
+        env = {k: v for k, v in self._ENV.items() if k != "QUESTIONS_RECIPIENT_EMAIL"}
+
+        from app.bots import SUPERHERO
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            recipient = SUPERHERO.questions_recipient_email
+
+        self.assertEqual(recipient, "digest@example.com")
+
+        payload = self._sent_payload(recipient, env=env)
+
+        self.assertEqual(payload["to"], [{"email": "digest@example.com"}])
+        self.assertNotIn("cc", payload)
+
+    def test_the_post_digest_still_uses_the_cc_list(self):
+        # Guards the fix above from being taken too far: only the guide list is
+        # narrowed to one person.
+        path = _path()
+        posts = [{
+            "id": "a1",
+            "title": "A thread",
+            "link": "https://example.com/a1",
+            "summary": "",
+            "relevant": True,
+        }]
+
+        sent = mock.Mock()
+        sent.status_code = 200
+        sent.raise_for_status.return_value = None
+
+        with mock.patch.dict("os.environ", self._ENV, clear=True):
+            with mock.patch("app.main.datetime") as clock:
+                clock.now.return_value = datetime(2026, 10, 14, 1, 5, tzinfo=timezone.utc)
+                with mock.patch("app.main.API_SESSION.post", return_value=sent) as post:
+                    main.send_email_notification(posts, path)
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["cc"],
+            [{"email": "someone@example.com"}, {"email": "another@example.com"}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

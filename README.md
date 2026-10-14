@@ -27,6 +27,10 @@ The daily list goes out after `QUESTIONS_HOUR` UTC (23:00 by default). It is a
 work queue, not a daily trickle: anything you have not been sent yet comes back
 tomorrow, so you work through it at your own pace instead of falling behind.
 
+It goes to `QUESTIONS_RECIPIENT_EMAIL` and to nobody else. The post digest cc's
+`CC_EMAILS`, but the guide list deliberately never does, since it is a work
+queue for whoever writes the articles rather than something to pass around.
+
 Questions come out phrased the way someone would type them into a search box,
 with the subject filled in from the post when the post left it implicit. They
 exclude anything that needs the poster's own face, prescription or budget to

@@ -1153,6 +1153,9 @@ def run_bot(
                 due = due_questions(question_backlog)
                 if due:
                     log(f"Sending {len(due)} question(s) that could each be a guide...")
+                    # No cc_emails on purpose. The question list is one person's
+                    # work queue, so it must never pick up CC_EMAILS the way the
+                    # post digest does.
                     if send_questions_email(
                         due, len(question_backlog), API_SESSION, questions_email
                     ):
