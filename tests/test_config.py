@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -210,6 +211,120 @@ class ConfigDefaultsTests(unittest.TestCase):
             name="x", user_agent="python:x:1.0", env_prefix="X_", subreddits=["a"]
         )
         self.assertEqual(config.subreddit_intervals, {})
+
+    def test_question_collecting_is_off_unless_asked_for(self):
+        config = BotConfig(
+            name="x", user_agent="python:x:1.0", env_prefix="X_", subreddits=["a"]
+        )
+        self.assertFalse(config.collect_questions)
+
+
+class QuestionHarvestConfigTests(unittest.TestCase):
+    def test_only_the_glasses_bot_harvests_questions(self):
+        # Lead generation has no guides to write, so the business bot pays for
+        # the extra model calls for nothing.
+        self.assertTrue(SUPERHERO.collect_questions)
+        self.assertFalse(BUSINESS.collect_questions)
+
+    def test_question_files_differ(self):
+        self.assertNotEqual(
+            SUPERHERO.default_questions_file, BUSINESS.default_questions_file
+        )
+
+    def test_questions_file_is_defaulted(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(BUSINESS.questions_path, BUSINESS.default_questions_file)
+
+    def test_questions_path_lands_on_the_railway_volume(self):
+        # A backlog stored outside the volume is reset on redeploy, which loses
+        # the topics and re-sends all of them the next evening.
+        with mock.patch.dict(
+            "os.environ", {"RAILWAY_VOLUME_MOUNT_PATH": "/data"}, clear=True
+        ):
+            self.assertEqual(
+                SUPERHERO.questions_path,
+                os.path.join("/data", SUPERHERO.default_questions_file),
+            )
+            self.assertEqual(
+                SUPERHERO.seen_ids_path,
+                os.path.join("/data", SUPERHERO.default_seen_ids_file),
+            )
+
+    def test_state_files_stay_relative_without_a_volume(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(BUSINESS.questions_path, BUSINESS.default_questions_file)
+            self.assertEqual(
+                BUSINESS.seen_ids_path, BUSINESS.default_seen_ids_file
+            )
+
+    def test_questions_path_prefers_an_explicit_setting(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "RAILWAY_VOLUME_MOUNT_PATH": "/data",
+                "SUPERHERO_QUESTIONS_PATH": "/elsewhere/q.json",
+            },
+            clear=True,
+        ):
+            self.assertEqual(SUPERHERO.questions_path, "/elsewhere/q.json")
+
+    def test_questions_go_to_the_digest_recipient_by_default(self):
+        with mock.patch.dict(
+            "os.environ", {"SUPERHERO_RECIPIENT_EMAIL": "you@example.com"}, clear=True
+        ):
+            self.assertEqual(
+                SUPERHERO.questions_recipient_email, "you@example.com"
+            )
+
+    def test_questions_recipient_can_be_split_off(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "SUPERHERO_RECIPIENT_EMAIL": "you@example.com",
+                "SUPERHERO_QUESTIONS_RECIPIENT_EMAIL": "writer@example.com",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                SUPERHERO.questions_recipient_email, "writer@example.com"
+            )
+
+    def test_question_pass_defaults_to_the_relevance_model(self):
+        with mock.patch.dict(
+            "os.environ", {"SUPERHERO_RELEVANCE_MODEL": "some-model"}, clear=True
+        ):
+            self.assertEqual(SUPERHERO.questions_model, "some-model")
+
+    def test_question_pass_can_use_its_own_model(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "SUPERHERO_RELEVANCE_MODEL": "some-model",
+                "SUPERHERO_QUESTIONS_MODEL": "other-model",
+            },
+            clear=True,
+        ):
+            self.assertEqual(SUPERHERO.questions_model, "other-model")
+
+    def test_questions_go_out_late_in_the_day_by_default(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(SUPERHERO.questions_hour, 23)
+
+    def test_questions_hour_is_read_from_the_environment(self):
+        with mock.patch.dict(
+            "os.environ", {"SUPERHERO_QUESTIONS_HOUR": "18"}, clear=True
+        ):
+            self.assertEqual(SUPERHERO.questions_hour, 18)
+
+    def test_questions_hour_is_clamped_into_range(self):
+        with mock.patch.dict(
+            "os.environ", {"SUPERHERO_QUESTIONS_HOUR": "99"}, clear=True
+        ):
+            self.assertEqual(SUPERHERO.questions_hour, 23)
+        with mock.patch.dict(
+            "os.environ", {"SUPERHERO_QUESTIONS_HOUR": "-5"}, clear=True
+        ):
+            self.assertEqual(SUPERHERO.questions_hour, 0)
 
 
 if __name__ == "__main__":

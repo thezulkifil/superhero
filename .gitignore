@@ -8,6 +8,11 @@ superhero_seen_ids.json
 business_seen_ids.json
 *.seen.json.tmp
 
+# Question backlog, which grows on its own and is meant to be edited by hand
+questions.json
+superhero_questions.json
+*_questions.json.tmp
+
 # Python
 __pycache__/
 *.py[cod]

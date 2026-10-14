@@ -106,4 +106,9 @@ SUPERHERO = BotConfig(
     ],
     relevance_prompt=RELEVANCE_PROMPT,
     default_seen_ids_file="superhero_seen_ids.json",
+    # The site is about glasses, so the questions this audience asks are exactly
+    # the article topics it needs. Lead generation has no equivalent use for them,
+    # so the business bot leaves this off.
+    collect_questions=True,
+    default_questions_file="superhero_questions.json",
 )

@@ -5,7 +5,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 import feedparser
 import requests
@@ -13,6 +13,19 @@ from dotenv import load_dotenv
 
 from app.bots import BOTS, DEFAULT_BOT, get_bot
 from app.config import BotConfig
+from app.config import resolve_seen_ids_path as config_resolve_seen_ids_path
+from app.email import send_html_email
+from app.questions import (
+    QUESTIONS_PROMPT,
+    Questions,
+    add_questions,
+    due_questions,
+    load_questions,
+    mark_sent,
+    question_key,
+    save_questions,
+    send_questions_email,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -67,14 +80,11 @@ RELEVANCE_RETRY_DELAYS = (20.0, 40.0)
 def resolve_seen_ids_path() -> str:
     """Pick where to remember post ids.
 
-    Railway injects RAILWAY_VOLUME_MOUNT_PATH pointing at the attached volume,
-    so prefer that over hardcoding a path. Do not set RAILWAY_VOLUME_MOUNT_PATH
-    by hand, Railway overwrites it.
+    Delegates to :mod:`app.config`, which owns the volume-aware path, so this
+    module-level default and the per-bot setting can never disagree about where
+    state belongs.
     """
-    volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    if volume_path:
-        return os.path.join(volume_path.rstrip("/"), "seen_ids.json")
-    return "seen_ids.json"
+    return config_resolve_seen_ids_path()
 
 
 SEEN_IDS_PATH = os.getenv("SEEN_IDS_PATH", "").strip() or resolve_seen_ids_path()
@@ -141,6 +151,60 @@ RELEVANCE_RESPONSE_FORMATS: list[dict[str, Any] | None] = [
     None,
 ]
 _FORMAT_INDEX_BY_MODEL: dict[str, int] = {}
+
+# ---------------------------------------------------------------------------
+# Question harvesting.
+#
+# This runs on the posts the relevance filter already approved, so it is a much
+# smaller batch than relevance triage and costs a fraction of it. The model has
+# to do two things at once that triage never does: pick the question out of the
+# post, and rewrite it so it stands on its own without the surrounding thread.
+# ---------------------------------------------------------------------------
+
+QUESTIONS_SCHEMA = {
+    "name": "guide_topics",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "question": {"type": "string"},
+                    },
+                    "required": ["id", "question"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": False,
+    },
+}
+
+# Tried in order exactly like the relevance formats, and degraded the same way.
+# Kept in a separate list because a model can accept one shape here and not there.
+QUESTIONS_RESPONSE_FORMATS: list[dict[str, Any] | None] = [
+    {"type": "json_schema", "json_schema": QUESTIONS_SCHEMA},
+    {"type": "json_object"},
+    None,
+]
+
+# Tracked apart from the relevance cache. Both passes often share a model, and
+# sharing one cache would make each one inherit the other's chosen shape.
+_QUESTION_FORMAT_INDEX_BY_MODEL: dict[str, int] = {}
+
+# Only posts the relevance filter approved get read for questions, so these
+# batches are far smaller and cost a fraction of triage.
+QUESTION_BATCH_SIZE = int(os.getenv("QUESTION_BATCH_SIZE", "10"))
+# The question usually lives in the body rather than the title, so this pass is
+# given a wider window than triage's hundred characters.
+QUESTION_SNIPPET_CHARS = 250
+# Each post yields at most three questions, so a batch cannot overrun this.
+QUESTIONS_MAX_TOKENS = int(os.getenv("QUESTIONS_MAX_TOKENS", "1024"))
 
 # The keyword pass is a two-tier intake gate. A single eyewear term admits a
 # post on its own, which is what keeps intake high. Ambient words are far too
@@ -542,25 +606,36 @@ def request_relevant_ids(
     return None
 
 
-def _attempt_relevance_formats(
+def _attempt_formats(
     posts: list[Post],
     model: str,
     headers: dict[str, str],
     known_ids: set[str],
     timeout: int,
-    prompt: str = RELEVANCE_SYSTEM_PROMPT,
-) -> set[str] | None:
-    """Try each request shape once against the model."""
-    start = _FORMAT_INDEX_BY_MODEL.get(model, 0)
+    build_payload: Callable[..., dict[str, Any]],
+    formats: list[dict[str, Any] | None],
+    index_cache: dict[str, int],
+    parse: Callable[[str, set[str]], Any],
+    prompt: str,
+    label: str,
+) -> Any | None:
+    """Try each request shape once against the model, starting where it last worked.
 
-    for index in range(start, len(RELEVANCE_RESPONSE_FORMATS)):
-        response_format = RELEVANCE_RESPONSE_FORMATS[index]
+    ``build_payload``, ``parse`` and ``label`` are what separate the two model
+    passes, so the step-down from a strict schema to a bare JSON object is written
+    once and both inherit it. The label keeps the log lines telling the two
+    passes apart, which matters when a free-plan rate limit hits one of them.
+    """
+    start = index_cache.get(model, 0)
+
+    for index in range(start, len(formats)):
+        response_format = formats[index]
 
         try:
             response = API_SESSION.post(
                 GROQ_URL,
                 headers=headers,
-                json=build_relevance_payload(posts, model, response_format, prompt),
+                json=build_payload(posts, model, response_format, prompt),
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -572,17 +647,41 @@ def _attempt_relevance_formats(
             if _is_shape_rejection(exc) and response_format is not None:
                 log(f"{model} rejected the request shape; retrying with fewer options.")
                 continue
-            log(f"Relevance filter request failed: {exc}")
+            log(f"{label} request failed: {exc}")
             return None
         except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-            log(f"Relevance filter request failed: {exc}")
+            log(f"{label} request failed: {exc}")
             return None
 
-        _FORMAT_INDEX_BY_MODEL[model] = index
-        return parse_relevant_ids(content, known_ids)
+        index_cache[model] = index
+        return parse(content, known_ids)
 
-    log(f"{model} rejected every request shape; skipping this batch.")
+    log(f"{model} rejected every request shape for {label}; skipping this batch.")
     return None
+
+
+def _attempt_relevance_formats(
+    posts: list[Post],
+    model: str,
+    headers: dict[str, str],
+    known_ids: set[str],
+    timeout: int,
+    prompt: str = RELEVANCE_SYSTEM_PROMPT,
+) -> set[str] | None:
+    """Try each relevance request shape once against the model."""
+    return _attempt_formats(
+        posts,
+        model,
+        headers,
+        known_ids,
+        timeout,
+        build_relevance_payload,
+        RELEVANCE_RESPONSE_FORMATS,
+        _FORMAT_INDEX_BY_MODEL,
+        parse_relevant_ids,
+        prompt,
+        "Relevance filter",
+    )
 
 
 def _is_shape_rejection(exc: requests.HTTPError) -> bool:
@@ -625,6 +724,167 @@ def filter_relevant_posts(
         log(f"Relevance filter kept {len(batch_ids)}/{len(batch)} post(s).")
 
     return relevant
+
+
+def build_questions_payload(
+    posts: list[Post],
+    model: str,
+    response_format: dict[str, Any] | None,
+    prompt: str = QUESTIONS_PROMPT,
+) -> dict[str, Any]:
+    """Build the request that pulls guide topics out of one batch of posts.
+
+    Sends the same title-plus-snippet shape relevance triage uses, so a post
+    that was relevant is already one worth reading questions out of. A wider
+    snippet is allowed here: the question usually sits in the body, and a title
+    alone rarely contains one.
+    """
+    candidates = [
+        {
+            "id": post["id"],
+            "title": post.get("title", ""),
+            "summary": strip_html(post.get("summary", ""))[:QUESTION_SNIPPET_CHARS],
+        }
+        for post in posts
+    ]
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    "List the questions worth writing guides about.\n\n"
+                    + json.dumps(candidates, indent=2)
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": QUESTIONS_MAX_TOKENS,
+        "reasoning_effort": REASONING_EFFORT,
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    return payload
+
+
+def parse_questions(content: str, known_ids: set[str]) -> dict[str, list[str]]:
+    """Group the questions a model returned by the post they came from.
+
+    An id that was not in the batch is dropped rather than attached to nothing,
+    and a post with no usable question is left out entirely so callers do not have
+    to tell "no questions" apart from "post not mentioned". Duplicates within one
+    response collapse too, since a reasoning model can repeat itself.
+    """
+    if not content:
+        return {}
+
+    found: dict[str, list[str]] = {}
+    for payload in reversed(extract_json_objects(content)):
+        if "questions" not in payload:
+            continue
+        entries = payload["questions"]
+        if not isinstance(entries, list):
+            log("Question extraction returned 'questions' as a non-list; ignoring batch.")
+            return {}
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            post_id = str(entry.get("id", ""))
+            question = entry.get("question")
+            if post_id not in known_ids or not isinstance(question, str):
+                continue
+            text = question.strip()
+            if not text or question_key(text) in {question_key(q) for q in found.get(post_id, [])}:
+                continue
+            found.setdefault(post_id, []).append(text)
+
+        return found
+
+    log("Question extraction response had no 'questions' field; treating batch as empty.")
+    return {}
+
+
+def request_questions(
+    posts: list[Post],
+    model: str,
+    timeout: int = RELEVANCE_TIMEOUT_SECONDS,
+    prompt: str = QUESTIONS_PROMPT,
+) -> dict[str, list[str]] | None:
+    """Ask the model which questions one batch of posts is asking.
+
+    Returns None when the call fails, matching :func:`request_relevant_ids` so the
+    caller can tell "no questions worth writing" from "we never got an answer".
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        log("GROQ_API_KEY is not set, so no questions can be collected.")
+        return None
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    known_ids = {post["id"] for post in posts}
+
+    # The final None marks the last attempt, which does not sleep afterwards.
+    for delay in (*RELEVANCE_RETRY_DELAYS, None):
+        try:
+            return _attempt_formats(
+                posts,
+                model,
+                headers,
+                known_ids,
+                timeout,
+                build_questions_payload,
+                QUESTIONS_RESPONSE_FORMATS,
+                _QUESTION_FORMAT_INDEX_BY_MODEL,
+                parse_questions,
+                prompt,
+                "Question extraction",
+            )
+        except _RateLimited:
+            if delay is None:
+                log("Groq kept rate limiting us; skipping this question batch.")
+                return None
+            log(f"Rate limited by Groq; retrying in {delay:.0f}s.")
+            time.sleep(delay)
+
+    return None
+
+
+def collect_questions_from_posts(
+    posts: list[Post],
+    model: str = DEFAULT_RELEVANCE_MODEL,
+    prompt: str = QUESTIONS_PROMPT,
+) -> dict[str, list[str]] | None:
+    """Return the guide topics found across every post, grouped by post id.
+
+    Returns None only when every batch failed, so the caller can hold the whole
+    list back and try again next cycle. A partial result is returned as-is: the
+    posts in the failed batches are retried, the rest are not paid for twice.
+    """
+    if not posts:
+        return {}
+
+    found: dict[str, list[str]] = {}
+    failed = 0
+    for start in range(0, len(posts), QUESTION_BATCH_SIZE):
+        batch = posts[start : start + QUESTION_BATCH_SIZE]
+        batch_questions = request_questions(
+            batch, model, RELEVANCE_TIMEOUT_SECONDS, prompt
+        )
+        if batch_questions is None:
+            failed += 1
+            log(f"Skipping {len(batch)} post(s) whose questions could not be read.")
+            continue
+        found.update(batch_questions)
+
+    if failed and failed >= -(-len(posts) // QUESTION_BATCH_SIZE):
+        log("No question batch succeeded; holding the posts for the next cycle.")
+        return None
+
+    if found:
+        log(f"Found {sum(len(v) for v in found.values())} question(s) in {len(found)} post(s).")
+    return found
 
 
 def load_seen_ids(path: str) -> SeenIds:
@@ -761,12 +1021,10 @@ def send_email_notification(
     sender_email: str | None = None,
 ) -> None:
     """Send email notification with collected posts via Brevo API."""
-    api_key = os.getenv("BREVO_API_KEY")
-    sender_email = sender_email or os.getenv("SENDER_EMAIL")
-    recipient_email = recipient_email or os.getenv("RECIPIENT_EMAIL")
-    cc_emails = parse_email_list(os.getenv("CC_EMAILS"))
+    sender = sender_email or os.getenv("SENDER_EMAIL")
+    recipient = recipient_email or os.getenv("RECIPIENT_EMAIL")
 
-    if not api_key or not sender_email or not recipient_email:
+    if not os.getenv("BREVO_API_KEY") or not sender or not recipient:
         log("Email not configured. Skipping notification.")
         log(f"Collected {len(collected_posts)} posts:")
         for post in collected_posts:
@@ -774,31 +1032,52 @@ def send_email_notification(
             print(f"  - {post['title']} -> {post['link']}{verdict}")
         return
 
-    html_body = build_email_html(collected_posts)
-    subject = build_email_subject(collected_posts)
+    send_html_email(
+        build_email_subject(collected_posts),
+        build_email_html(collected_posts),
+        API_SESSION,
+        recipient_email=recipient,
+        sender_email=sender,
+        cc_emails=parse_email_list(os.getenv("CC_EMAILS")),
+        log=log,
+    )
 
-    payload = {
-        "sender": {"email": sender_email},
-        "to": [{"email": recipient_email}],
-        "subject": subject,
-        "htmlContent": html_body,
-    }
 
-    if cc_emails:
-        payload["cc"] = [{"email": addr} for addr in cc_emails]
+def harvest_questions(
+    posts: list[Post],
+    model: str,
+    prompt: str,
+    backlog: Questions,
+    path: str,
+    retry: list[Post],
+) -> None:
+    """Read questions out of relevant posts and fold them into the backlog.
 
-    try:
-        response = API_SESSION.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"accept": "application/json", "api-key": api_key},
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        cc_note = f" (cc: {', '.join(cc_emails)})" if cc_emails else ""
-        log(f"Email sent successfully to {recipient_email}{cc_note}")
-    except requests.RequestException as exc:
-        log(f"Failed to send email: {exc}")
+    ``retry`` is the list of posts still waiting on an answer. It is trimmed here
+    rather than by the caller, because which posts failed is only known once the
+    model has been asked. A post the model answered but found no question in
+    counts as answered: it was read, and there was nothing there worth a guide.
+    """
+    if not posts:
+        return
+
+    found = collect_questions_from_posts(posts, model, prompt)
+
+    if found is None:
+        retry[:] = posts
+        log(f"Holding {len(posts)} post(s) until the next cycle.")
+        return
+
+    retry[:] = [post for post in retry if post["id"] not in found]
+    added = add_questions(
+        backlog,
+        found,
+        {post["id"]: (post.get("title", ""), post.get("link", "")) for post in posts},
+    )
+
+    if added:
+        save_questions(path, backlog)
+        log(f"Added {len(added)} new question(s); backlog holds {len(backlog)}.")
 
 
 def run_bot(
@@ -814,17 +1093,39 @@ def run_bot(
     seen_ids_path: str = SEEN_IDS_PATH,
     subreddit_intervals: dict[str, int] | None = None,
     recipient_email: str | None = None,
+    collect_questions: bool = False,
+    questions_path: str = "",
+    questions_model: str = DEFAULT_RELEVANCE_MODEL,
+    questions_prompt: str = QUESTIONS_PROMPT,
+    questions_email: str | None = None,
+    questions_hour: int = 23,
 ) -> None:
     keywords = list(keywords or KEYWORDS)
     ambient = list(ambient or [])
+    questions_prompt = questions_prompt or QUESTIONS_PROMPT
     seen_ids = load_seen_ids(seen_ids_path)
     if seen_ids:
         log(f"Remembered {len(seen_ids)} previously seen post(s).")
+
+    # Questions are stored, not just forwarded, so the backlog outlives the
+    # process. Saving on every change is cheap: a cycle adds a handful of
+    # entries at most, and losing them to a redeploy would lose the only record
+    # of which topics have already been sent.
+    question_backlog: Questions = {}
+    if collect_questions:
+        question_backlog = load_questions(questions_path)
+        if question_backlog:
+            log(f"Remembered {len(question_backlog)} question(s) from earlier runs.")
+
     collected_posts: list[Post] = []
     last_notification_hour = None
+    last_questions_day = None
+    # Posts whose questions could not be read this cycle. They are already marked
+    # seen, so without this they would never be offered again.
+    unread_posts: list[Post] = []
     limiter = RateLimiter()
     last_fetched: dict[str, float] = {}
-    
+
     while True:
         cycle_started_at = time.monotonic()
 
@@ -841,7 +1142,28 @@ def run_bot(
             else:
                 # Nothing relevant yet this hour; retry next cycle without marking the hour as done
                 log("No relevant posts collected, skipping hourly notification.")
-        
+
+        # The whole outstanding backlog goes out once a day, not just today's
+        # arrivals, since the job is to work through it rather than to stay on
+        # top of it. Questions that have already been sent stay out.
+        if collect_questions and last_questions_day != now.date():
+            if now.hour < questions_hour:
+                log(f"Not sending questions yet; waiting for hour {questions_hour} UTC.")
+            else:
+                due = due_questions(question_backlog)
+                if due:
+                    log(f"Sending {len(due)} question(s) that could each be a guide...")
+                    if send_questions_email(
+                        due, len(question_backlog), API_SESSION, questions_email
+                    ):
+                        mark_sent(question_backlog, [entry["key"] for entry in due])
+                else:
+                    log("No questions in the backlog, skipping the daily list.")
+                save_questions(questions_path, question_backlog)
+                # Marked even when nothing was sent, otherwise an empty backlog
+                # would re-log on every cycle for the rest of the evening.
+                last_questions_day = now.date()
+
         # Fetch every due feed, then judge them in one pass so the model sees a
         # single batch per cycle instead of one request per subreddit.
         feeds = fetch_due_subreddit_feeds(
@@ -895,7 +1217,19 @@ def run_bot(
             save_seen_ids(seen_ids_path, seen_ids)
             log(f"{len(kept)}/{len(new_entries)} post(s) were relevant.")
 
+            # Only the posts that survived triage are read for questions, which
+            # keeps this pass a fraction of the size of the one above it.
+            if collect_questions:
+                harvest_questions(kept + unread_posts, questions_model, questions_prompt,
+                                  question_backlog, questions_path, unread_posts)
+
         if once:
+            # A one-shot run will not reach the hour gate that emails the list, so
+            # print the backlog here instead of leaving it on disk unlooked at.
+            if collect_questions and question_backlog:
+                log(f"Question backlog holds {len(question_backlog)} question(s):")
+                for entry in question_backlog.values():
+                    print(f"  - {entry['question']}")
             return
 
         # Sleep for the remaining time to maintain consistent interval
@@ -948,6 +1282,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override the first-pass keyword list (case-insensitive).",
     )
+    parser.add_argument(
+        "--no-questions",
+        action="store_true",
+        help="Skip collecting guide topics from the relevant posts.",
+    )
+    parser.add_argument(
+        "--questions-path",
+        default=None,
+        help="Where to keep the question backlog. Defaults to the bot's own setting.",
+    )
+    parser.add_argument(
+        "--questions-hour",
+        type=int,
+        default=None,
+        help="Hour of the day, UTC, to email the question list. Defaults to the bot's own setting.",
+    )
     return parser.parse_args(argv)
 
 
@@ -967,6 +1317,12 @@ def main(argv: list[str] | None = None) -> None:
         seen_ids_path=config.seen_ids_path,
         subreddit_intervals=config.subreddit_intervals,
         recipient_email=config.recipient_email,
+        collect_questions=config.collect_questions and not args.no_questions,
+        questions_path=args.questions_path or config.questions_path,
+        questions_model=config.questions_model,
+        questions_prompt=config.questions_prompt or QUESTIONS_PROMPT,
+        questions_email=config.questions_recipient_email,
+        questions_hour=args.questions_hour if args.questions_hour is not None else config.questions_hour,
     )
 
 
